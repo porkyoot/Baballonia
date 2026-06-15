@@ -4,6 +4,9 @@ namespace Baballonia.LibV4L2Capture.V4L2;
 
 
 public class Device : IDisposable {
+    // Debug callback: set from LibV4L2Capture to forward to ILogger
+    public static Action<string>? DebugLog;
+    private static void Log(string msg) => DebugLog?.Invoke(msg);
     public void Dispose()
     {
         StopCapture();
@@ -233,6 +236,7 @@ public class Device : IDisposable {
     {
         var req = GetBuffers();
         _bufferCount = req.count;
+        Log($"REQBUFS returned count={_bufferCount}");
 
         _bufferStarts = new IntPtr[_bufferCount];
         _bufferLengths = new uint[_bufferCount];
@@ -247,6 +251,8 @@ public class Device : IDisposable {
             var ret = NativeMethods.v4l2_ioctl_safe(_fileDescriptor, Ioctl.VIDIOC_QUERYBUF, ref buf);
             if (ret < 0) throw new Exception($"VIDIOC_QUERYBUF failed: errno={Marshal.GetLastWin32Error()}");
 
+            Log($"QUERYBUF[{i}]: length={buf.length} offset=0x{buf.offset:X}");
+
             _bufferLengths[i] = buf.length;
             _bufferStarts[i] = NativeMethods.mmap(
                 IntPtr.Zero, buf.length,
@@ -255,6 +261,7 @@ public class Device : IDisposable {
                 _fileDescriptor, new IntPtr(buf.offset));
 
             if (_bufferStarts[i] == -1) throw new Exception($"mmap failed: errno={Marshal.GetLastWin32Error()}");
+            Log($"mmap[{i}]: addr=0x{_bufferStarts[i]:X}");
         }
     }
 
@@ -269,6 +276,7 @@ public class Device : IDisposable {
 
             var ret = NativeMethods.v4l2_ioctl_safe(_fileDescriptor, Ioctl.VIDIOC_QBUF, ref buf);
             if (ret < 0) throw new Exception($"VIDIOC_QBUF failed: errno={Marshal.GetLastWin32Error()}");
+            Log($"QBUF[{i}]: queued");
         }
     }
 
@@ -277,9 +285,12 @@ public class Device : IDisposable {
         var type = v4l2_buf_type.V4L2_BUF_TYPE_VIDEO_CAPTURE;
         var ret = NativeMethods.v4l2_ioctl_safe(_fileDescriptor, Ioctl.VIDIOC_STREAMON, ref type);
         if (ret < 0) throw new Exception($"VIDIOC_STREAMON failed: errno={Marshal.GetLastWin32Error()}");
+        Log($"STREAMON: ok (fd={_fileDescriptor})");
     }
 
-    public bool FrameReady(int timeoutMs = 0)
+    // Block-waits up to timeoutMs for a frame (POLLIN). Use 50ms as default —
+    // long enough to reliably catch 30+ fps frames, short enough for responsive cancellation.
+    public bool FrameReady(int timeoutMs = 50)
     {
         Data.pollfd[] fds =
         [
@@ -297,7 +308,7 @@ public class Device : IDisposable {
         var revents = fds[0].revents;
 
         if ((revents & Data.POLLERR) != 0 || (revents & Data.POLLHUP) != 0)
-            throw new Exception("Device disconnected or error on file descriptor");
+            throw new Exception($"Device error on fd={_fileDescriptor}: revents=0x{revents:X}");
 
         return (revents & Data.POLLIN) != 0;
     }
@@ -314,6 +325,9 @@ public class Device : IDisposable {
         var ret = NativeMethods.v4l2_ioctl_safe(_fileDescriptor, Ioctl.VIDIOC_DQBUF, ref buf);
         if (ret != 0)
             throw new Exception($"VIDIOC_DQBUF failed: errno={Marshal.GetLastWin32Error()}");
+
+        if (buf.index == 0 && buf.sequence <= 2)
+            Log($"DQBUF: index={buf.index} seq={buf.sequence} bytesused={buf.bytesused}");
 
         frame = new byte[buf.bytesused];
         Marshal.Copy(_bufferStarts[buf.index], frame, 0, (int)buf.bytesused);
@@ -332,7 +346,9 @@ public class Device : IDisposable {
 
     public void StartCapture()
     {
+        Log($"StartCapture: fd={_fileDescriptor} format={PixelFormat}");
         var f = GetCurrentFormat();
+        Log($"Current format: {f.pix.width}x{f.pix.height} pixfmt=0x{f.pix.pixelformat:X}");
         InitMMapBuffers();
         QueueAllBuffers();
         StartStreaming();

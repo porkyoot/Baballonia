@@ -3,17 +3,18 @@ using System.Runtime.InteropServices;
 namespace Baballonia.LibV4L2Capture.V4L2;
 
 internal static class NativeMethods {
-    [DllImport("libv4l2", SetLastError = true, CallingConvention = CallingConvention.Cdecl)]
-    public static extern int v4l2_open(string file, int flags);
+    // Use raw libc syscalls instead of libv4l2 wrappers. libv4l2 intercepts VIDIOC_S_FMT
+    // on MJPEG-only devices to set up its own format conversion, which then causes our
+    // subsequent VIDIOC_S_FMT calls to fail with EBUSY. Since we decode MJPEG ourselves
+    // via Cv2.ImDecode, we don't need libv4l2's conversion layer.
+    [DllImport("libc.so.6", SetLastError = true, EntryPoint = "open")]
+    public static extern int v4l2_open([MarshalAs(UnmanagedType.LPStr)] string file, int flags);
 
-    [DllImport("libv4l2", SetLastError = true, CallingConvention = CallingConvention.Cdecl)]
+    [DllImport("libc.so.6", SetLastError = true, EntryPoint = "close")]
     public static extern int v4l2_close(int fd);
 
-    [DllImport("libv4l2", SetLastError = true, CallingConvention = CallingConvention.Cdecl)]
+    [DllImport("libc.so.6", SetLastError = true, EntryPoint = "ioctl")]
     public static extern int v4l2_ioctl(int fd, uint request, IntPtr arg);
-
-    [DllImport("libv4l2", SetLastError = true, CallingConvention = CallingConvention.Cdecl)]
-    public static extern int v4l2_read(int fd, byte[] buffer, int size);
 
     public static int v4l2_ioctl_safe<T>(int fd, uint request, ref T arg)
         where T : unmanaged

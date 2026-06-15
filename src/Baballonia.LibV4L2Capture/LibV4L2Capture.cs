@@ -14,6 +14,7 @@ public sealed class LibV4L2Capture(string source, ILogger<LibV4L2Capture> logger
 
     public override Task<bool> StartCapture()
     {
+        Device.DebugLog = msg => Logger.LogDebug("[V4L2] " + msg);
         try
         {
             _device = Device.Connect(Source);
@@ -32,6 +33,7 @@ public sealed class LibV4L2Capture(string source, ILogger<LibV4L2Capture> logger
             return Task.FromResult(false);
         }
 
+        Logger.LogInformation("Capture setup complete, starting frame loop");
         _cts = new CancellationTokenSource();
         var token = _cts.Token;
 
@@ -43,6 +45,11 @@ public sealed class LibV4L2Capture(string source, ILogger<LibV4L2Capture> logger
     private void DecodeMJPEG(byte[] frame)
     {
         var mat = Cv2.ImDecode(frame, ImreadModes.Grayscale);
+        if (mat.Empty())
+        {
+            Logger.LogWarning($"ImDecode returned empty mat (frame was {frame.Length} bytes) — skipping");
+            return;
+        }
         SetRawMat(mat);
     }
 
@@ -58,12 +65,24 @@ public sealed class LibV4L2Capture(string source, ILogger<LibV4L2Capture> logger
 
     private async Task VideoCapture_UpdateLoop(CancellationToken ct)
     {
+        int frameCount = 0;
+        int noFrameCount = 0;
+
         while (!ct.IsCancellationRequested && _device != null)
         {
             try
             {
+                // FrameReady blocks up to 50ms waiting for POLLIN — reliable at any frame rate.
+                // CaptureFrame internally calls FrameReady(50), so this loop idles at 20 Hz
+                // when no frames arrive, while still responding to cancellation promptly.
                 if (_device.CaptureFrame(out byte[]? frame))
                 {
+                    frameCount++;
+                    noFrameCount = 0;
+
+                    if (frameCount == 1 || frameCount % 100 == 0)
+                        Logger.LogDebug($"Frame #{frameCount}: {frame?.Length ?? 0} bytes");
+
                     if (frame is { Length: > 0 })
                     {
                         switch (_device.PixelFormat)
@@ -82,13 +101,18 @@ public sealed class LibV4L2Capture(string source, ILogger<LibV4L2Capture> logger
                 }
                 else
                 {
-                    await Task.Delay(1, ct);
+                    noFrameCount++;
+                    if (noFrameCount % 20 == 0)
+                        Logger.LogWarning($"No frame from device after {noFrameCount} polls (~{noFrameCount}s)");
+
+                    // Yield to the async runtime briefly so cancellation is checked.
+                    await Task.Yield();
                 }
             }
-            // catch (TaskCanceledException)
-            // {
-            //     return;
-            // }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
             catch(Exception e)
             {
                 SetRawMat(new Mat());
@@ -98,6 +122,8 @@ public sealed class LibV4L2Capture(string source, ILogger<LibV4L2Capture> logger
                 break;
             }
         }
+
+        Logger.LogInformation($"Capture loop exited: {frameCount} frames captured");
     }
 
     public override Task<bool> StopCapture()
