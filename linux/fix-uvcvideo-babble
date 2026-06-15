@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""
+fix-uvcvideo-babble  —  binary-patch uvcvideo.ko for ESP32-S3 OpenIris/Babble trackers.
+
+Root cause: BabbleFirmware returns dwMaxPayloadTransferSize=64 after UVC probe
+negotiation. Linux's uvc_alloc_urb_buffers() computes npackets=1 (64/64) and then
+rejects it with "if (npackets <= 1) return 0" → VIDIOC_STREAMON returns ENOMEM.
+
+Two-byte fix in uvc_alloc_urb_buffers():
+  1. lea -1(%rdx,%rsi,1),%eax  →  lea +1(...)  — payload=0 now gives npackets=1
+  2. jbe (jump if ≤1) → jb (jump if <1)        — npackets==1 is now allowed
+
+After patching, the PKCS#7 signature embedded in the module is invalidated.
+The kernel rejects modules with INVALID signatures (EKEYREJECTED) even when
+sig_enforce is off. We strip the trailer so the module is unsigned (no signature
+= allowed with a warning when sig_enforce is not set).
+
+Usage:
+  fix-uvcvideo-babble [KERNEL_VERSION ...]
+  With no args, patches all installed kernels.
+"""
+
+import sys, os, shutil, subprocess, tempfile, struct
+
+# ── patch target ───────────────────────────────────────────────────────────────
+#
+# Only ONE byte needs changing.
+#
+# uvc_alloc_urb_buffers computes:
+#   npackets = DIV_ROUND_UP(payload_size, wMaxPacketSize)  = (64+64-1)/64 = 1
+# then checks:
+#   if (npackets <= 1) return 0;   ← kills us
+#
+# Fix: change JBE (≤1) → JB (<1), so npackets==1 is allowed.
+# npackets=1 → URB size = 1×64 = 64 bytes = exactly one UVC payload per URB.
+# The bulk decode path (uvc_video_decode_bulk) handles exactly one payload per URB,
+# so this gives correct frame assembly.
+#
+# We do NOT change the npackets formula (lea -1 → lea +1 would give npackets=2,
+# packing two payloads per URB, which breaks the decode path and produces noise).
+
+PATCH_PATTERN  = bytes([0x83, 0xf8, 0x01, 0x0f, 0x86, 0xbf])  # cmp $1; jbe <near>
+PATCH_PATCHED  = bytes([0x83, 0xf8, 0x01, 0x0f, 0x82, 0xbf])  # cmp $1; jb  <near>
+PATCH_OFFSET   = 4
+PATCH_FROM, PATCH_TO = 0x86, 0x82   # JBE rel32 → JB rel32
+
+MODULE_SIG_STRING = b'~Module signature appended~\n'   # 28 bytes
+
+
+# ── helpers ────────────────────────────────────────────────────────────────────
+
+def find_unique(data: bytes, pattern: bytes, name: str) -> int:
+    """Return the single offset of pattern in data, or -1 and print error."""
+    hits, start = [], 0
+    while True:
+        idx = data.find(pattern, start)
+        if idx == -1:
+            break
+        hits.append(idx)
+        start = idx + 1
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) == 0:
+        print(f"  ERROR: {name} pattern not found", file=sys.stderr)
+    else:
+        print(f"  ERROR: {name} pattern found {len(hits)}× (expected 1)", file=sys.stderr)
+    return -1
+
+
+def is_already_patched(data: bytes) -> bool:
+    return PATCH_PATCHED in data
+
+
+def patch_module(ko_path: str) -> bool:
+    """Apply the jbe→jb patch in-place to a decompressed .ko. Returns True on success."""
+    data = bytearray(open(ko_path, 'rb').read())
+
+    if is_already_patched(bytes(data)):
+        print("  Patch already applied — skipping byte edit.")
+        return True
+
+    off = find_unique(bytes(data), PATCH_PATTERN, 'jbe→jb patch')
+    if off < 0:
+        return False
+    byte_off = off + PATCH_OFFSET
+    if data[byte_off] != PATCH_FROM:
+        print(f"  ERROR: patch site has 0x{data[byte_off]:02x}, expected 0x{PATCH_FROM:02x}", file=sys.stderr)
+        return False
+    data[byte_off] = PATCH_TO
+    print(f"  0x{off:x}+{PATCH_OFFSET}: 0x{PATCH_FROM:02x}→0x{PATCH_TO:02x}  (JBE → JB  in uvc_alloc_urb_buffers)")
+
+    open(ko_path, 'wb').write(bytes(data))
+    return True
+
+
+def strip_module_sig(ko_path: str) -> bool:
+    """
+    Remove the PKCS#7 signature appended by Canonical's kernel build.
+    After binary-patching, the embedded signature is invalid → EKEYREJECTED.
+    Stripping it makes the module 'unsigned' which the kernel accepts with a
+    warning when module.sig_enforce is not set (the default without Secure Boot).
+    """
+    data = open(ko_path, 'rb').read()
+    if not data.endswith(MODULE_SIG_STRING):
+        print("  No module signature trailer found — nothing to strip.")
+        return True
+
+    # struct module_signature (12 bytes) sits just before the trailer string
+    # field sig_len is a big-endian u32 at offset 8 within that struct
+    struct_off = len(data) - len(MODULE_SIG_STRING) - 12
+    sig_len = struct.unpack_from('>I', data, struct_off + 8)[0]
+    bare_size = struct_off - sig_len
+    if bare_size <= 0:
+        print("  ERROR: computed bare_size <= 0; signature trailer looks corrupt", file=sys.stderr)
+        return False
+
+    open(ko_path, 'wb').write(data[:bare_size])
+    print(f"  Stripped {len(data) - bare_size}-byte signature trailer → unsigned module ({bare_size} bytes)")
+    return True
+
+
+# ── per-kernel orchestration ───────────────────────────────────────────────────
+
+def fix_kernel(kver: str) -> bool:
+    candidates = [
+        (f"/lib/modules/{kver}/kernel/drivers/media/usb/uvc/uvcvideo.ko.zst", 'zst'),
+        (f"/lib/modules/{kver}/kernel/drivers/media/usb/uvc/uvcvideo.ko.xz",  'xz'),
+        (f"/lib/modules/{kver}/kernel/drivers/media/usb/uvc/uvcvideo.ko.gz",  'gz'),
+        (f"/lib/modules/{kver}/kernel/drivers/media/usb/uvc/uvcvideo.ko",     None),
+    ]
+    src, compression = next(((p, c) for p, c in candidates if os.path.exists(p)), (None, None))
+    if src is None:
+        print(f"  SKIP {kver}: uvcvideo module not found", file=sys.stderr)
+        return False
+
+    print(f"\nKernel {kver}  →  {os.path.basename(src)}")
+
+    # Backup the original compressed module (once only; .orig = Canonical stock)
+    backup = src + '.orig'
+    if not os.path.exists(backup):
+        shutil.copy2(src, backup)
+        print(f"  Backup: {backup}")
+    else:
+        print(f"  Backup already exists: {backup}")
+
+    with tempfile.NamedTemporaryFile(suffix='.ko', delete=False) as tf:
+        tmp_ko = tf.name
+
+    try:
+        # Decompress from ORIGINAL backup so we always start from a clean state
+        src_for_decomp = backup  # always decompress the original
+        if compression == 'zst':
+            subprocess.run(['zstd', '-d', src_for_decomp, '-o', tmp_ko, '-f', '-q'], check=True)
+        elif compression == 'xz':
+            with open(tmp_ko, 'wb') as out:
+                subprocess.run(['xz', '-d', '-k', '-c', src_for_decomp], stdout=out, check=True)
+        elif compression == 'gz':
+            with open(tmp_ko, 'wb') as out:
+                subprocess.run(['gunzip', '-c', src_for_decomp], stdout=out, check=True)
+        else:
+            shutil.copy2(src_for_decomp, tmp_ko)
+
+        # Apply patches
+        if not patch_module(tmp_ko):
+            return False
+
+        # Strip Canonical's PKCS#7 signature (patching invalidates it)
+        if not strip_module_sig(tmp_ko):
+            return False
+
+        # Recompress back into place
+        if compression == 'zst':
+            subprocess.run(['zstd', '-f', '-q', tmp_ko, '-o', src], check=True)
+        elif compression == 'xz':
+            with open(src, 'wb') as out:
+                subprocess.run(['xz', '-f', '-k', '-c', tmp_ko], stdout=out, check=True)
+        elif compression == 'gz':
+            with open(src, 'wb') as out:
+                subprocess.run(['gzip', '-c', tmp_ko], stdout=out, check=True)
+        else:
+            shutil.copy2(tmp_ko, src)
+
+        print(f"  Installed: {src}")
+
+        # Hot-reload if this is the running kernel
+        running = subprocess.run(['uname', '-r'], capture_output=True, text=True).stdout.strip()
+        if kver == running:
+            print(f"  Hot-reloading uvcvideo ...")
+            subprocess.run(['modprobe', '-r', 'uvcvideo'], capture_output=True)
+            r = subprocess.run(['modprobe', 'uvcvideo'], capture_output=True, text=True)
+            if r.returncode == 0:
+                print("  uvcvideo reloaded OK.")
+            else:
+                print(f"  Warning: modprobe uvcvideo: {r.stderr.strip()}", file=sys.stderr)
+
+        return True
+
+    finally:
+        try:
+            os.unlink(tmp_ko)
+        except OSError:
+            pass
+
+
+# ── entry point ────────────────────────────────────────────────────────────────
+
+def main():
+    if os.geteuid() != 0:
+        print("Error: must run as root (sudo fix-uvcvideo-babble)", file=sys.stderr)
+        sys.exit(1)
+
+    kernels = sys.argv[1:] if len(sys.argv) > 1 else sorted(os.listdir('/lib/modules'))
+    if not kernels:
+        print("No kernels found in /lib/modules", file=sys.stderr)
+        sys.exit(1)
+
+    success = sum(1 for kv in kernels if fix_kernel(kv))
+    print(f"\nDone: {success}/{len(kernels)} kernel(s) patched.")
+    if success == 0:
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,13 @@
+#!/bin/sh
+# /etc/kernel/postinst.d/fix-uvcvideo-babble
+# Automatically re-patches uvcvideo.ko after each kernel install.
+# Installed by the babble-uvc-fix package/script.
+set -e
+KVER="$1"
+if [ -z "$KVER" ]; then
+    exit 0
+fi
+if command -v fix-uvcvideo-babble >/dev/null 2>&1; then
+    echo "babble-uvc-fix: patching uvcvideo for kernel $KVER ..."
+    fix-uvcvideo-babble "$KVER"
+fi

@@ -44,10 +44,14 @@ public sealed class OpenCvCapture(string source, ILogger<OpenCvCapture> logger) 
         {
             try
             {
-                if (int.TryParse(Source, out var index))
+                int index;
+                if (int.TryParse(Source, out index))
+                    _videoCapture = await Task.Run(() => VideoCapture.FromCamera(index, PreferredBackend), cts.Token);
+                else if (Source.StartsWith("/dev/video") && int.TryParse(Source["/dev/video".Length..], out index))
+                    // Linux V4L2 device path: /dev/videoN → use FromCamera(N) so GStreamer picks v4l2src
                     _videoCapture = await Task.Run(() => VideoCapture.FromCamera(index, PreferredBackend), cts.Token);
                 else
-                    _videoCapture = await Task.Run(() => new VideoCapture(Source), cts.Token);
+                    _videoCapture = await Task.Run(() => new VideoCapture(Source, PreferredBackend), cts.Token);
             }
             catch (Exception e)
             {
