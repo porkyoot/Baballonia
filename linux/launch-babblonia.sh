@@ -12,7 +12,10 @@
 
 set -euo pipefail
 
-BABALL_DIR="${1:-$HOME/Baballonia}"
+# When installed as linux-launch.sh inside the Baballonia directory, default to
+# the script's own directory so it works from the app menu without arguments.
+_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BABALL_DIR="${1:-$_SELF_DIR}"
 LOG="$HOME/babblonia.log"
 
 if [[ ! -x "$BABALL_DIR/Baballonia.Desktop" ]]; then
